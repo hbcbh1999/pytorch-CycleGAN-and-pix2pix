@@ -1,5 +1,7 @@
+import math
 import torch
 import torch.nn as nn
+import torch.legacy as legacy
 from torch.nn import init
 import functools
 from torch.autograd import Variable
@@ -44,6 +46,8 @@ def define_G(input_nc, output_nc, ngf, which_model_netG, norm='batch', use_dropo
         netG = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout, gpu_ids=gpu_ids)
     elif which_model_netG == 'unet_256':
         netG = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout, gpu_ids=gpu_ids)
+    elif which_model_netG == 'cascaded_refinement':
+        netG = CascadedRefinementGenerator(norm_layer=norm_layer, gpu_ids=gpu_ids)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % which_model_netG)
     if len(gpu_ids) > 0:
@@ -301,6 +305,60 @@ class UnetSkipConnectionBlock(nn.Module):
         else:
             return torch.cat([self.model(x), x], 1)
 
+
+dims = [1024] * 5 + [512] * 2 + [128] + [32]
+
+# Cascaded Refinement Network Generator
+class CascadedRefinementGenerator(nn.Module):
+    def __init__(self, input_width=256,
+                 norm_layer=nn.BatchNorm2d, gpu_ids=[]):
+        super(CascadedRefinementGenerator, self).__init__()
+        self.gpu_ids = gpu_ids
+
+        sp = 4
+        subblock = None
+        while sp <= input_width:
+            subblock = CascadedRefinementBlock(sp, subblock, norm_layer)
+            sp *= 2
+
+        self.refine = subblock
+        global dims
+        dim_idx = int(math.log(sp // 2, 2) - 2)
+        self.final = nn.Conv2d(dims[dim_idx], 3, kernel_size=1, padding=0)
+        self.model = nn.Sequential(self.refine, self.final, nn.Tanh())
+
+    def forward(self, input):
+        if self.gpu_ids and isinstance(input.data, torch.cuda.FloatTensor):
+            return nn.parallel.data_parallel(self.model, input, self.gpu_ids)
+        else:
+            return self.model(input)
+
+
+class CascadedRefinementBlock(nn.Module):
+    def __init__(self, sp, subblock, norm_layer):
+        super(CascadedRefinementBlock, self).__init__()
+        dim_idx = int(math.log(sp, 2) - 2)
+        global dims
+        dim = dims[dim_idx]
+        self.sp = sp
+        if sp > 4:
+            down = nn.AvgPool2d(3, stride=2, padding=[1, 1],
+                                count_include_pad=False)
+            up = nn.UpsamplingBilinear2d(scale_factor=2)
+            self.block = nn.Sequential(down, subblock, up)
+
+        input_dim = dims[dim_idx - 1] + 3 if sp > 4 else 3
+        self.conv = [nn.Conv2d(input_dim, dim, kernel_size=3, padding=1),
+                     norm_layer(dim), nn.LeakyReLU(0.2, True),
+                     nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+                     norm_layer(dim), nn.LeakyReLU(0.2, True)]
+        self.conv = nn.Sequential(*self.conv)
+
+    def forward(self, x):
+        if self.sp > 4:
+            x = torch.cat([self.block(x), x], 1)
+        refined = self.conv(x)
+        return refined
 
 # Defines the PatchGAN discriminator with the specified arguments.
 class NLayerDiscriminator(nn.Module):
